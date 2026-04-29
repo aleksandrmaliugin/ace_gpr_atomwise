@@ -1,0 +1,21 @@
+name: ace_gpr
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.12
+  - pip
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - scikit-learn
+  - tqdm
+  - h5py
+  - ase
+  - pytorch
+  - pip:
+      - gpytorch
+      - linear-operator
+      - plotly
