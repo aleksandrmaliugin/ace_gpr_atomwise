@@ -1,317 +1,318 @@
 import torch
-import gpytorch
-from contextlib import contextmanager
-from linear_operator import to_linear_operator
+import torch.nn as nn
+from tqdm import tqdm
 
+from ace_config import ACEConfig
 
-def pack_structures(structures, device, dtype):
-    xs = [torch.as_tensor(x, device=device, dtype=dtype).contiguous() for x in structures]
-
-    ptr = [0]
-    for x in xs:
-        ptr.append(ptr[-1] + x.shape[0])
-
-    atoms = torch.cat(xs, dim=0)
-    ptr = torch.tensor(ptr, device=device, dtype=torch.long)
-
-    return atoms, ptr
-
-
-def unpack_structure(atoms, ptr, idx):
-    start = int(ptr[idx].item())
-    end = int(ptr[idx + 1].item())
-    return atoms[start:end]
-
-
-def atomic_sum_kernel_dense(structures_1, structures_2, atom_kernel):
-    device = structures_1[0].device
-    dtype = structures_1[0].dtype
-
-    K = torch.zeros(
-        len(structures_1),
-        len(structures_2),
-        device=device,
-        dtype=dtype,
-    )
-
-    for i, X1 in enumerate(structures_1):
-        for j, X2 in enumerate(structures_2):
-            K_atoms = atom_kernel(X1, X2).to_dense()
-            K[i, j] = K_atoms.sum()
-
-    return K
-    
-
-class _AtomicSumLookupKernel(gpytorch.kernels.Kernel):
-    has_lengthscale = False
-
-    def __init__(self, atom_dim):
+class SparseAtomicGPR(nn.Module):
+    def __init__(
+        self,
+        x_train=None,
+        model_path=None,
+        config=None,
+        M=100,
+        div=0.001,
+        init_lengthscale=1.0,
+        init_sigma2=1e-4,
+        init_outputscale=1.0,
+        jitter=1e-8,
+        device=None,
+    ):
         super().__init__()
 
-        self.atom_dim = atom_dim
+        self.device = device or "cpu"
+        self.jitter = jitter
 
-        self.register_parameter(
-            name="raw_lengthscale",
-            parameter=torch.nn.Parameter(torch.zeros(1, atom_dim)),
-        )
-        self.register_constraint("raw_lengthscale", gpytorch.constraints.Positive())
+        self.register_buffer("y_train", None)
+        
+        self.register_buffer("x_M", None)
+        self.register_buffer("K_NM_train", None)
+        self.register_buffer("c", None)
+        
+        self.register_buffer("L_KMM", None)
+        self.register_buffer("L_KSS", None)
 
-        self.register_parameter(
-            name="raw_outputscale",
-            parameter=torch.nn.Parameter(torch.zeros(())),
-        )
-        self.register_constraint("raw_outputscale", gpytorch.constraints.Positive())
+        self.config = config
 
-        self.register_buffer("train_atoms", torch.empty(0, atom_dim))
-        self.register_buffer("train_ptr", torch.zeros(1, dtype=torch.long))
+        if model_path is not None:
+            state = torch.load(model_path, map_location=self.device, weights_only=False)
 
-        self._query_atoms = None
-        self._query_ptr = None
+            self.y_train = state["y_train"].to(self.device) if state["y_train"] is not None else None
+            
+            self.x_M = state["x_M"].to(self.device)
+            self.K_NM_train = state["K_NM_train"].to(self.device) if state["K_NM_train"] is not None else None
+            self.c = state["c"].to(self.device) if state["c"] is not None else None
+            
+            self.log_sigma2 = nn.Parameter(state["log_sigma2"].to(self.device))
+            
+            self.L_KMM = state["L_KMM"].to(self.device) if state["L_KMM"] is not None else None
+            self.L_KSS = state["L_KSS"].to(self.device) if state["L_KSS"] is not None else None
+
+            self.log_lengthscale = nn.Parameter(
+                state.get(
+                    "log_lengthscale",
+                    torch.ones(state["x_M"].shape[1], dtype=torch.float64, device=self.device).log()
+                ).to(self.device)
+            )
+            
+            self.log_outputscale = nn.Parameter(
+                state.get(
+                    "log_outputscale",
+                    torch.tensor(1.0, dtype=torch.float64, device=self.device).log()
+                ).to(self.device)
+            )
+
+            self.config = ACEConfig.from_dict(state["config"]) if state["config"] is not None else None
+        
+        else:
+            if x_train is None:
+                raise ValueError("Provide x_train if model_path is not given.")
+
+            self.log_lengthscale = nn.Parameter(
+                torch.full(
+                    (x_train[0].shape[1],),
+                    float(init_lengthscale),
+                    dtype=torch.float64,
+                    device=self.device,
+                ).log()
+            )
+
+            self.log_sigma2 = nn.Parameter(
+                torch.tensor(init_sigma2, dtype=torch.float64, device=self.device).log()
+            )
+
+            self.log_outputscale = nn.Parameter(
+                torch.tensor(init_outputscale, dtype=torch.float64, device=self.device).log()
+            )
+
+            x_M = self.select_inducing_points(x_train, M=M, div=div)
+            self.x_M = x_M.to(self.device)
 
     @property
     def lengthscale(self):
-        return self.raw_lengthscale_constraint.transform(self.raw_lengthscale)
+        return torch.exp(self.log_lengthscale) + 1e-6
 
-    @lengthscale.setter
-    def lengthscale(self, value):
-        value = torch.as_tensor(
-            value,
-            dtype=self.raw_lengthscale.dtype,
-            device=self.raw_lengthscale.device,
-        )
-        self.initialize(
-            raw_lengthscale=self.raw_lengthscale_constraint.inverse_transform(value)
-        )
+    @property
+    def sigma2(self):
+        return torch.exp(self.log_sigma2) + 1e-12
 
     @property
     def outputscale(self):
-        return self.raw_outputscale_constraint.transform(self.raw_outputscale)
+        return torch.exp(self.log_outputscale) + 1e-12
 
-    @outputscale.setter
-    def outputscale(self, value):
-        value = torch.as_tensor(
-            value,
-            dtype=self.raw_outputscale.dtype,
-            device=self.raw_outputscale.device,
-        )
-        self.initialize(
-            raw_outputscale=self.raw_outputscale_constraint.inverse_transform(value)
-        )
+    def rbf_kernel(self, x1, x2):
+        device = self.log_lengthscale.device
 
-    @property
-    def n_train_structures(self):
-        return self.train_ptr.numel() - 1
+        x1 = torch.as_tensor(x1, dtype=torch.float64, device=device)
+        x2 = torch.as_tensor(x2, dtype=torch.float64, device=device)
 
-    def set_train_structures(self, structures, device, dtype):
-        self.train_atoms, self.train_ptr = pack_structures(
-            structures, device=device, dtype=dtype
-        )
+        diff = x1[:, None, :] - x2[None, :, :]
+        diff = diff / self.lengthscale[None, None, :]
 
-    def _get_structure(self, idx):
-        idx = int(idx)
+        dist2 = (diff ** 2).sum(dim=-1)
+        K_rbf = torch.exp(-0.5 * dist2)
 
-        if idx < self.n_train_structures:
-            return unpack_structure(self.train_atoms, self.train_ptr, idx)
+        return self.outputscale * K_rbf
 
-        if self._query_atoms is None:
-            raise RuntimeError("Query structures are not registered.")
-
-        qidx = idx - self.n_train_structures
-        return unpack_structure(self._query_atoms, self._query_ptr, qidx)
-
-    def _structures_from_ids(self, ids):
-        ids = ids.view(-1).long()
-        return [self._get_structure(i) for i in ids]
-
-    @contextmanager
-    def register_query_structures(self, structures):
-        device = self.train_atoms.device
-        dtype = self.train_atoms.dtype
-
-        self._query_atoms, self._query_ptr = pack_structures(
-            structures, device=device, dtype=dtype
-        )
-
-        start = self.n_train_structures
-        test_ids = torch.arange(
-            start,
-            start + len(structures),
-            device=device,
-            dtype=torch.long,
-        ).unsqueeze(-1)
-
-        try:
-            yield test_ids
-        finally:
-            self._query_atoms = None
-            self._query_ptr = None
-
-    def forward(self, x1, x2, diag=False, **params):
-        structures_1 = self._structures_from_ids(x1)
-        structures_2 = self._structures_from_ids(x2)
-
-        X1_flat = torch.cat(structures_1, dim=0)
-        X2_flat = torch.cat(structures_2, dim=0)
-
-        idx1 = torch.tensor(
-            [i for i, X in enumerate(structures_1) for _ in range(X.shape[0])],
-            dtype=torch.long,
-            device=X1_flat.device,
-        )
-        idx2 = torch.tensor(
-            [j for j, X in enumerate(structures_2) for _ in range(X.shape[0])],
-            dtype=torch.long,
-            device=X2_flat.device,
-        )
-
-        diff = X1_flat[:, None, :] - X2_flat[None, :, :]
-        sqdist = ((diff / self.lengthscale) ** 2).sum(dim=-1)
-        K_atoms = self.outputscale * torch.exp(-0.5 * sqdist)
-
-        K = torch.zeros(
-            len(structures_1),
-            len(structures_2),
-            dtype=K_atoms.dtype,
-            device=K_atoms.device,
-        )
-
-        I = idx1[:, None].expand_as(K_atoms)
-        J = idx2[None, :].expand_as(K_atoms)
-
-        K.index_put_((I, J), K_atoms, accumulate=True)
-
-        if diag:
-            return torch.diagonal(K, dim1=-2, dim2=-1)
-
-        return to_linear_operator(K)
-
-
-class AtomicSumLookupKernel(gpytorch.kernels.Kernel):
-    has_lengthscale = False
-
-    def __init__(self, atom_dim):
-        super().__init__()
-
-        self.atom_kernel = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.RBFKernel(ard_num_dims=atom_dim)
-        )
-
-        self.register_buffer("train_atoms", torch.empty(0, atom_dim))
-        self.register_buffer("train_ptr", torch.zeros(1, dtype=torch.long))
-
-        self._query_atoms = None
-        self._query_ptr = None
-
-    @property
-    def n_train_structures(self):
-        return self.train_ptr.numel() - 1
-
-    def set_train_structures(self, structures, device, dtype):
-        atoms, ptr = pack_structures(structures, device=device, dtype=dtype)
-        self.train_atoms = atoms
-        self.train_ptr = ptr
-
-    def _get_structure(self, idx):
-        idx = int(idx)
-
-        if idx < self.n_train_structures:
-            return unpack_structure(self.train_atoms, self.train_ptr, idx)
-
-        if self._query_atoms is None:
-            raise RuntimeError("Query structures are not registered.")
-
-        qidx = idx - self.n_train_structures
-        return unpack_structure(self._query_atoms, self._query_ptr, qidx)
-
-    def _structures_from_ids(self, ids):
-        ids = ids.view(-1).long()
-        return [self._get_structure(i) for i in ids]
-
-    @contextmanager
-    def register_query_structures(self, structures):
-        device = self.train_atoms.device
-        dtype = self.train_atoms.dtype
-
-        self._query_atoms, self._query_ptr = pack_structures(
-            structures,
-            device=device,
-            dtype=dtype,
-        )
-
-        start = self.n_train_structures
-        test_ids = torch.arange(
-            start,
-            start + len(structures),
-            device=device,
-            dtype=torch.long,
-        ).unsqueeze(-1)
-
-        try:
-            yield test_ids
-        finally:
-            self._query_atoms = None
-            self._query_ptr = None
-
-    def forward(self, x1, x2, diag=False, **params):
-        structures_1 = self._structures_from_ids(x1)
-        structures_2 = self._structures_from_ids(x2)
-
-        K = atomic_sum_kernel_dense(
-            structures_1,
-            structures_2,
-            self.atom_kernel,
-        )
-
-        if diag:
-            return torch.diagonal(K)
-
-        return to_linear_operator(K)
-
-
-class AtomicCountMean(gpytorch.means.Mean):
-    def __init__(self, kernel):
-        super().__init__()
-        self.kernel = kernel
-        self.constant = torch.nn.Parameter(torch.zeros(()))
-
-    def forward(self, structure_ids):
-        ids = structure_ids.view(-1).long()
-        counts = []
-
-        for sid in ids:
-            X = self.kernel._get_structure(int(sid))
-            counts.append(X.shape[0])
-
-        counts = torch.tensor(
-            counts,
-            dtype=self.constant.dtype,
-            device=self.constant.device,
-        )
-
-        return counts * self.constant
-
-
-class AtomicSumExactGP(gpytorch.models.ExactGP):
-    def __init__(self, n_train, train_y, likelihood, atom_dim):
-        train_ids = torch.arange(
-            n_train,
-            device=train_y.device,
-            dtype=torch.long,
-        ).unsqueeze(-1)
-
-        super().__init__(train_ids, train_y, likelihood)
-
-        #self.mean_module = gpytorch.means.ConstantMean()
+    @torch.no_grad()
+    def select_inducing_points(self, x_train, M=100, div=0.001):
         
-        #self.mean_module = gpytorch.means.ZeroMean()
-        self.covar_module = AtomicSumLookupKernel(atom_dim)
-        self.mean_module = AtomicCountMean(self.covar_module)
+        all_atoms = torch.cat(
+            [torch.as_tensor(s, dtype=torch.float64, device=self.device) for s in x_train],
+            dim=0,
+        )
 
-    def forward(self, structure_ids):
-        mean = self.mean_module(
-            structure_ids.to(dtype=self.train_targets.dtype)
-        ).squeeze(-1)
+        x_M = [all_atoms[0]]
 
-        covar = self.covar_module(structure_ids)
+        for atom in tqdm(all_atoms[1:]):
+            xm = torch.stack(x_M, dim=0)
 
-        return gpytorch.distributions.MultivariateNormal(mean, covar)
+            k = self.rbf_kernel(atom[None, :], xm).squeeze(0)
+
+            k_xx = self.rbf_kernel(atom[None, :], atom[None, :]).squeeze()
+            k_mm = torch.diag(self.rbf_kernel(xm, xm))
+            sims = k / torch.sqrt(k_xx * k_mm)
+
+            if sims.max() < div:
+                x_M.append(atom)
+
+            if len(x_M) == M:
+                break
+
+        print(f"Selected {len(x_M)} inducing points out of {M}")
+
+        return torch.stack(x_M, dim=0)
+
+    def build_K_NM(self, x_train):
+        
+        S = len(x_train)
+        M = self.x_M.shape[0]
+
+        K_NM = torch.zeros(
+            S,
+            M,
+            dtype=torch.float64,
+            device=self.x_M.device,
+        )
+
+        for s, x in enumerate(x_train):
+            x = torch.as_tensor(x, dtype=torch.float64, device=self.x_M.device)
+
+            K = self.rbf_kernel(x, self.x_M)
+
+            K_NM[s] = K.sum(dim=0)
+
+        return K_NM
+
+    def safe_cholesky(self, A, jitter=None, max_tries=4):
+        if jitter is None:
+            jitter = self.jitter
+
+        A = 0.5 * (A + A.T)
+
+        for _ in range(max_tries):
+            try:
+                A_try = A.clone()
+                A_try.diagonal().add_(jitter)
+                return torch.linalg.cholesky(A_try)
+            except torch.linalg.LinAlgError:
+                jitter *= 10.0
+
+        raise RuntimeError(f"Cholesky failed, final jitter={jitter:.2e}")
+
+    def solve_c(self, K_NM, y):
+        
+        K_MM = self.rbf_kernel(self.x_M, self.x_M)
+    
+        # A = K_MM + (K_NM.T @ K_NM) / self.sigma2    
+        A = K_MM + (K_NM.T @ K_NM) / self.sigma2
+    
+        b = (K_NM.T @ y) / self.sigma2
+    
+        L = self.safe_cholesky(A)
+        c = torch.cholesky_solve(b[:, None], L).squeeze(-1)
+    
+        return c
+
+    def training_loss(self, train_x, train_y):
+        train_y = torch.as_tensor(train_y, dtype=torch.float64, device=self.x_M.device)
+
+        K_NM = self.build_K_NM(train_x)
+
+        c = self.solve_c(K_NM, train_y)
+
+        y_pred = K_NM @ c
+        loss = ((y_pred - train_y) ** 2).mean()
+
+        return loss, y_pred, c
+
+    def fit_c(self, train_x, train_y, build_uncertainty=False):
+        train_y = torch.as_tensor(train_y, dtype=torch.float64, device=self.x_M.device)
+
+        K_NM = self.build_K_NM(train_x)
+
+        c = self.solve_c(K_NM, train_y)
+
+        self.c = c.detach()
+        self.K_NM_train = K_NM.detach()
+        self.y_train = train_y.detach()
+        
+        K_MM = self.rbf_kernel(self.x_M, self.x_M).detach()
+        self.L_KMM = self.safe_cholesky(K_MM)
+
+        if build_uncertainty == True:
+
+            K_MM_inv_K_NM_T = torch.cholesky_solve(
+                self.K_NM_train.T,
+                self.L_KMM,
+            )
+    
+            K_SS = self.K_NM_train @ K_MM_inv_K_NM_T
+            K_SS = K_SS + self.sigma2.detach() * torch.eye(
+                K_SS.shape[0],
+                dtype=torch.float64,
+                device=self.x_M.device,
+            )
+    
+            self.L_KSS = self.safe_cholesky(K_SS)
+
+        return self.c
+
+    def fit_c_no_grad(self, train_x, train_y, build_uncertainty=False):
+        with torch.no_grad():
+            return self.fit_c(train_x, train_y, build_uncertainty)
+
+    def check_descriptor_dim(self, x):
+        if isinstance(x, torch.Tensor):
+            D = x.shape[1]
+        else:
+            D = x[0].shape[1]
+    
+        if D != self.x_M.shape[1]:
+            raise ValueError(
+                f"Descriptor dimension mismatch: got {D}, "
+                f"expected {self.x_M.shape[1]}"
+            )
+
+    def forward(self, x):
+        self.check_descriptor_dim(x)
+    
+        if self.c is None:
+            raise RuntimeError("Call fit_c(x, y) before prediction.")
+    
+        K_NM = self.build_K_NM(x)
+    
+        return K_NM @ self.c
+
+    def predict_uncertainty(self, x):
+        if self.c is None:
+            raise RuntimeError("Call fit_c(train_x, train_y) first.")
+
+        if self.K_NM_train is None or self.L_KMM is None or self.L_KSS is None:
+            raise RuntimeError("Uncertainty matrices are missing. Re-run fit_c().")
+
+        K_NM_test = self.build_K_NM(x)
+
+        mean = K_NM_test @ self.c
+
+        K_MM_inv_K_NM_train_T = torch.cholesky_solve(
+            self.K_NM_train.T,
+            self.L_KMM,
+        )
+
+        K_star_S = K_NM_test @ K_MM_inv_K_NM_train_T
+
+        K_MM_inv_K_NM_test_T = torch.cholesky_solve(
+            K_NM_test.T,
+            self.L_KMM,
+        )
+
+        K_star_star = K_NM_test @ K_MM_inv_K_NM_test_T
+
+        tmp = torch.cholesky_solve(
+            K_star_S.T,
+            self.L_KSS,
+        )
+
+        cov = K_star_star - K_star_S @ tmp
+        var = torch.clamp(cov.diagonal(), min=1e-12)
+        std = torch.sqrt(var)
+
+        return mean, std
+
+    def save(self, path):
+        torch.save(
+            {
+                "x_M": self.x_M.detach(),
+                "log_lengthscale": self.log_lengthscale.detach(),
+                "log_sigma2": self.log_sigma2.detach(),
+                "log_outputscale": self.log_outputscale.detach(),
+                "c": self.c.detach() if self.c is not None else None,
+                "K_NM_train": self.K_NM_train.detach() if self.K_NM_train is not None else None,
+                "y_train": self.y_train.detach() if self.y_train is not None else None,
+                "L_KMM": self.L_KMM.detach() if self.L_KMM is not None else None,
+                "L_KSS": self.L_KSS.detach() if self.L_KSS is not None else None,
+                "config": self.config.to_dict() if self.config is not None else None,
+            },
+            path,
+        )

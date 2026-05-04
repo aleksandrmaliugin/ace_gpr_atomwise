@@ -1,18 +1,32 @@
 import numpy as np
 import torch
-import gpytorch
 import plotly.graph_objects as go
 
 
-def predict_structures(model, X_structures):
+def to_numpy(x):
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def predict_structures(model, X_structures, return_std=True):
     model.eval()
-    model.likelihood.eval()
 
-    with model.covar_module.register_query_structures(X_structures) as ids:
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            pred = model(ids)
+    with torch.no_grad():
+        if return_std:
+            pred, std = model.predict_uncertainty(X_structures)
+            return to_numpy(pred), to_numpy(std)
+        else:
+            pred = model(X_structures)
+            return to_numpy(pred), None
 
-    return pred.mean.detach().cpu().numpy(), pred.stddev.detach().cpu().numpy()
+
+def mae_metric_np(y_pred, y_true):
+    return np.mean(np.abs(y_pred - y_true))
+
+
+def rmse_metric_np(y_pred, y_true):
+    return np.sqrt(np.mean((y_pred - y_true) ** 2))
 
 
 def plot_results(
@@ -22,40 +36,37 @@ def plot_results(
     valid_x,
     valid_y,
     save_plot: bool = False,
+    filename: str = "gpr_accuracy.pdf",
 ):
     model.eval()
-    model.likelihood.eval()
 
-    device = next(model.parameters()).device
-    dtype = next(model.parameters()).dtype
+    train_y_np = to_numpy(train_y)
+    valid_y_np = to_numpy(valid_y)
 
-    train_y_np = train_y.detach().cpu().numpy()
-    valid_y_np = valid_y.detach().cpu().numpy()
+    train_pred, train_std = predict_structures(
+        model,
+        train_x,
+        return_std=True,
+    )
 
-    # train prediction: use train ids
-    train_ids = model.train_inputs[0].to(device)
+    valid_pred, valid_std = predict_structures(
+        model,
+        valid_x,
+        return_std=True,
+    )
 
-    with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        pred_train = model(train_ids)
+    mae_train = mae_metric_np(train_pred, train_y_np)
+    mae_valid = mae_metric_np(valid_pred, valid_y_np)
 
-    train_pred = pred_train.mean.detach().cpu().numpy()
-    train_std = pred_train.stddev.detach().cpu().numpy()
+    rmse_train = rmse_metric_np(train_pred, train_y_np)
+    rmse_valid = rmse_metric_np(valid_pred, valid_y_np)
 
-    # valid prediction: register valid structures
-    valid_x = [x.to(device=device, dtype=dtype) for x in valid_x]
-
-    with model.covar_module.register_query_structures(valid_x) as valid_ids:
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            pred_valid = model(valid_ids)
-
-    valid_pred = pred_valid.mean.detach().cpu().numpy()
-    valid_std = pred_valid.stddev.detach().cpu().numpy()
-
-    MAE_train = np.mean(np.abs(train_pred - train_y_np))
-    MAE_valid = np.mean(np.abs(valid_pred - valid_y_np))
-
-    xy_min = np.min(np.concatenate((train_pred, valid_pred, train_y_np, valid_y_np)))
-    xy_max = np.max(np.concatenate((train_pred, valid_pred, train_y_np, valid_y_np)))
+    xy_min = np.min(
+        np.concatenate([train_pred, valid_pred, train_y_np, valid_y_np])
+    )
+    xy_max = np.max(
+        np.concatenate([train_pred, valid_pred, train_y_np, valid_y_np])
+    )
 
     fig = go.Figure()
 
@@ -74,8 +85,11 @@ def plot_results(
             x=train_pred,
             y=train_y_np,
             mode="markers",
-            name=f"MAE<sub>train</sub> = {MAE_train * 1000:.3f} meV",
-            marker=dict(size=15, color="#636EFA"),
+            name=(
+                f"Train: RMSE = {rmse_train * 1000:.2f} meV, "
+                f"MAE = {mae_train * 1000:.2f} meV"
+            ),
+            marker=dict(size=12),
             error_x=dict(
                 type="data",
                 array=train_std,
@@ -89,8 +103,11 @@ def plot_results(
             x=valid_pred,
             y=valid_y_np,
             mode="markers",
-            name=f"MAE<sub>valid</sub> = {MAE_valid * 1000:.3f} meV",
-            marker=dict(size=15, color="#FFA15A"),
+            name=(
+                f"Valid: RMSE = {rmse_valid * 1000:.2f} meV, "
+                f"MAE = {mae_valid * 1000:.2f} meV"
+            ),
+            marker=dict(size=12),
             error_x=dict(
                 type="data",
                 array=valid_std,
@@ -101,32 +118,36 @@ def plot_results(
 
     fig.update_xaxes(
         title="E<sub>model</sub>, eV",
-        ticklabelstep=2,
         title_font=dict(size=25),
-        tickfont=dict(size=25),
+        tickfont=dict(size=22),
         automargin=True,
     )
 
     fig.update_yaxes(
         title="E<sub>DFT</sub>, eV",
-        ticklabelstep=2,
-        automargin=True,
         title_font=dict(size=25),
-        tickfont=dict(size=25),
+        tickfont=dict(size=22),
+        automargin=True,
     )
 
     fig.update_layout(
-        width=800,
-        height=600,
+        width=750,
+        height=750,
         margin=dict(r=50, t=50, pad=4),
-        font=dict(family="Arial", size=23),
+        font=dict(family="Arial", size=20),
+        legend=dict(x=0.02, y=0.98),
     )
 
-    fig.update_legends(x=0.77, y=0.5)
-
     if save_plot:
-        fig.write_image("gpr_accuracy.pdf")
+        fig.write_image(filename)
 
     fig.show()
 
-    return fig
+    metrics = {
+        "rmse_train": rmse_train,
+        "rmse_valid": rmse_valid,
+        "mae_train": mae_train,
+        "mae_valid": mae_valid,
+    }
+
+    return fig, metrics

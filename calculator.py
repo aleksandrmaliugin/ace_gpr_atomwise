@@ -1,71 +1,41 @@
-import ase
-import torch
 import numpy as np
-import gpytorch
+import torch
 
-from ace_extractor import *
-from dataset import calc_mindist, atoms_near_carbon
+from ase.calculators.calculator import Calculator, all_changes
 
 
-class Calculator:
-    def __init__(self, model, mode="TOTEN", dtype=torch.float64, device=None):
-        self.model = model
-        self.mode = mode
-        self.dtype = dtype
+class ACEGPRCalculator(Calculator):
+    implemented_properties = ["energy"]
 
-        if device is None:
-            device = next(model.parameters()).device
+    def __init__(self, model, extractor, device="cpu", dtype=torch.float64, **kwargs):
+        super().__init__(**kwargs)
 
-        self.device = device
-
-    def build_descriptor(self, atoms: ase.Atoms):
-        if self.mode == "TOTEN":
-            atom_indices = None
-            mindist = calc_mindist(atoms)
-            two = mindist * 2.1
-
-        elif self.mode == "E_ADS":
-            atoms, atom_indices = atoms_near_carbon(atoms)
-            mindist = calc_mindist(atoms)
-            two = mindist * 2.2
-
-        else:
-            raise ValueError(f"Unknown mode: {self.mode}")
-
-        one = mindist * 1.2
-        sqrt2 = mindist * np.sqrt(2.6)
-        sqrt3 = mindist * np.sqrt(3.6)
-
-        shells = {
-            "pairs": (0, one),
-            "sqrt2_pairs": (one, sqrt2),
-            "sqrt3_pairs": (sqrt2, sqrt3),
-            "two_pairs": (sqrt3, two),
-        }
-
-        descriptor = Cluster_Expansion(
-            atoms=atoms,
-            max_order=3,
-            shells=shells,
-            atom_indices=atom_indices,
-        ).descriptor
-
-        return torch.tensor(
-            descriptor,
-            dtype=self.dtype,
-            device=self.device,
-        )
-
-    def __call__(self, atoms: ase.Atoms):
+        self.model = model.to(device)
         self.model.eval()
 
-        X_new = self.build_descriptor(atoms)
+        self.extractor = extractor
+        self.device = device
+        self.dtype = dtype
 
-        with self.model.covar_module.register_query_structures([X_new]) as test_ids:
-            with torch.no_grad(), gpytorch.settings.fast_pred_var():
-                pred = self.model(test_ids)
+    def calculate(
+        self,
+        atoms=None,
+        properties=("energy",),
+        system_changes=all_changes,
+    ):
+        super().calculate(atoms, properties, system_changes)
 
-        energy = pred.mean.detach().cpu().numpy()
-        stddev = pred.stddev.detach().cpu().numpy()
+        desc = self.extractor(atoms)
 
-        return energy, stddev
+        if isinstance(desc, np.ndarray):
+            desc = torch.as_tensor(desc, dtype=self.dtype, device=self.device)
+        else:
+            desc = desc.to(device=self.device, dtype=self.dtype)
+
+        with torch.no_grad():
+            energy = self.model([desc])
+
+        if isinstance(energy, torch.Tensor):
+            energy = energy.detach().cpu().item()
+
+        self.results["energy"] = float(energy)

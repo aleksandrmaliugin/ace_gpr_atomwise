@@ -1,7 +1,5 @@
-import gpytorch
 import torch
 from torch.utils.data import random_split
-
 from copy import deepcopy
 
 
@@ -28,134 +26,126 @@ def get_tensors_from_subset(subset):
     y = subset.dataset.y[idx]
 
     return X, y
+
     
+def rmse_metric(y_pred, y_true):
+    return torch.sqrt(torch.mean((y_pred - y_true) ** 2))
 
-def train(
-    train_x: list[torch.Tensor],
-    train_y: torch.Tensor,
-    valid_x: list[torch.Tensor],
-    valid_y: torch.Tensor,
-    optimizer: torch.optim.Optimizer,
+
+def mae_metric(y_pred, y_true):
+    return torch.mean(torch.abs(y_pred - y_true))
+
+
+def train_sparse_atomic_gpr(
+    train_x,
+    train_y,
+    valid_x,
+    valid_y,
+    optimizer,
     scheduler,
-    model: gpytorch.models.ExactGP,
-    n_epochs: int = 100,
-    device: torch.device = torch.device("cpu"),
-    checkpoint_path: str = "best_gpr_model.pt",
-    metadata: dict | None = None,
+    model,
+    n_epochs=500,
+    device=torch.device("cpu"),
+    dtype=torch.float64,
+    model_path="best_sparse_atomic_gpr.pt",
+    min_lr=1e-5,
 ):
-
     model = model.to(device)
 
-    train_x = [x.to(device=device, dtype=torch.float64) for x in train_x]
-    valid_x = [x.to(device=device, dtype=torch.float64) for x in valid_x]
+    train_x = [torch.as_tensor(x, dtype=dtype, device=device) for x in train_x]
+    valid_x = [torch.as_tensor(x, dtype=dtype, device=device) for x in valid_x]
 
-    train_y = train_y.to(device=device, dtype=torch.float64)
-    valid_y = valid_y.to(device=device, dtype=torch.float64)
-
-    model.covar_module.set_train_structures(
-        train_x,
-        device=device,
-        dtype=train_y.dtype,
-    )
-
-    train_ids = model.train_inputs[0].to(device)
-
-    mll = gpytorch.mlls.ExactMarginalLogLikelihood(model.likelihood, model)
+    train_y = torch.as_tensor(train_y, dtype=dtype, device=device)
+    valid_y = torch.as_tensor(valid_y, dtype=dtype, device=device)
 
     history = {
-        "loss": [],
+        "rmse_train": [],
+        "rmse_valid": [],
         "mae_train": [],
         "mae_valid": [],
+        "sigma2": [],
+        "lengthscale_mean": [],
+        "outputscale": [],
         "lr": [],
     }
 
-    best_mae_valid = float("inf")
-    best_epoch = -1
+    best_rmse_valid = float("inf")
 
-    for i in range(n_epochs):
+    for epoch in range(n_epochs):
         model.train()
-        model.likelihood.train()
 
         optimizer.zero_grad()
-
-        output = model(train_ids)
-        loss = -mll(output, train_y)
-
+        loss, _, _ = model.training_loss(train_x, train_y)
         loss.backward()
         optimizer.step()
 
+        model.eval()
+
+        with torch.no_grad():
+            model.fit_c(
+                train_x,
+                train_y,
+                build_uncertainty=False,
+            )
+
+            pred_train = model(train_x)
+            pred_valid = model(valid_x)
+
+            rmse_train = rmse_metric(pred_train, train_y)
+            rmse_valid = rmse_metric(pred_valid, valid_y)
+
+            mae_train = mae_metric(pred_train, train_y)
+            mae_valid = mae_metric(pred_valid, valid_y)
+
+        rmse_train_val = rmse_train.item()
+        rmse_valid_val = rmse_valid.item()
+        mae_train_val = mae_train.item()
+        mae_valid_val = mae_valid.item()
+        lr_val = optimizer.param_groups[0]["lr"]
+
         if scheduler is not None:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(loss.item())
+                scheduler.step(rmse_valid_val)
             else:
                 scheduler.step()
 
-        if (i + 1) % 1 == 0 or i == 0:
-            model.eval()
-            model.likelihood.eval()
+            lr_val = optimizer.param_groups[0]["lr"]
 
-            with torch.no_grad(), gpytorch.settings.fast_pred_var():
-                pred_train = model(train_ids).mean
+        history["rmse_train"].append(rmse_train_val)
+        history["rmse_valid"].append(rmse_valid_val)
+        history["mae_train"].append(mae_train_val)
+        history["mae_valid"].append(mae_valid_val)
+        history["sigma2"].append(model.sigma2.item())
+        history["lengthscale_mean"].append(model.lengthscale.mean().item())
+        history["outputscale"].append(model.outputscale.item())
+        history["lr"].append(lr_val)
 
-            #     model.covar_module.set_query_structures(valid_x)
+        if rmse_valid_val < best_rmse_valid:
+            best_rmse_valid = rmse_valid_val
 
-            #     valid_ids = torch.arange(
-            #         model.covar_module.n_train_structures,
-            #         model.covar_module.n_train_structures + len(valid_x),
-            #         device=device,
-            #         dtype=torch.long,
-            #     ).unsqueeze(-1)
+            with torch.no_grad():
+                model.fit_c(
+                    train_x,
+                    train_y,
+                    build_uncertainty=True,
+                )
+                model.save(model_path)
 
-            #     pred_valid = model(valid_ids).mean
-
-            #     model.covar_module.clear_query_structures()
-
-                with model.covar_module.register_query_structures(valid_x) as valid_ids:
-                    pred_valid = model(valid_ids).mean
-
-                mae_train = torch.mean(torch.abs(pred_train - train_y))
-                mae_valid = torch.mean(torch.abs(pred_valid - valid_y))
-
-            loss_value = loss.item()
-            mae_train_value = mae_train.item()
-            mae_valid_value = mae_valid.item()
-            lr_value = optimizer.param_groups[0]["lr"]
-
-            history["loss"].append(loss_value)
-            history["mae_train"].append(mae_train_value)
-            history["mae_valid"].append(mae_valid_value)
-            history["lr"].append(lr_value)
-
-            if mae_valid_value < best_mae_valid:
-                best_mae_valid = mae_valid_value
-                best_epoch = i + 1
-
-                checkpoint = {
-                    "epoch": best_epoch,
-                    "best_mae_valid": best_mae_valid,
-                    "model_state_dict": deepcopy(model.state_dict()),
-                    "likelihood_state_dict": deepcopy(model.likelihood.state_dict()),
-                    "optimizer_state_dict": deepcopy(optimizer.state_dict()),
-                    "scheduler_state_dict": deepcopy(scheduler.state_dict()) if scheduler is not None else None,
-                    "train_y": train_y.detach().cpu(),
-                    "valid_y": valid_y.detach().cpu(),
-                    "history": history,
-                    "metadata": metadata if metadata is not None else {},
-                }
-
-                torch.save(checkpoint, checkpoint_path)
-
+        if epoch % 50 == 0:
             print(
-                f"Iter {i+1}/{n_epochs} "
-                f"Loss: {loss_value:.6f} "
-                f"MAE train: {mae_train_value:.6f} "
-                f"MAE valid: {mae_valid_value:.6f} "
-                f"best MAE valid: {best_mae_valid:.6f} "
-                f"noise: {model.likelihood.noise.item():.6f} "
-                f"lr: {lr_value:.3e}"
+                f"Iter {epoch+1}/{n_epochs} "
+                f"RMSE train: {rmse_train_val:.6f} "
+                f"RMSE valid: {rmse_valid_val:.6f} "
+                f"MAE train: {mae_train_val:.6f} "
+                f"MAE valid: {mae_valid_val:.6f} "
+                f"best RMSE valid: {best_rmse_valid:.6f} "
+                f"sigma2: {model.sigma2.item():.3e} "
+                f"ls_mean: {model.lengthscale.mean().item():.3e} "
+                f"outputscale: {model.outputscale.item():.3e} "
+                f"lr: {lr_val:.3e}"
             )
 
-            if lr_value < 1e-5:
-                break
+        if lr_val < min_lr:
+            break
 
-    return history, best_mae_valid
+    return history, best_rmse_valid
